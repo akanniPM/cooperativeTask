@@ -34,10 +34,5 @@ yarn-error.log*
 .orig
 
 # working artifacts
-*.patch
 AGENT RUN/
 problem-description.md
-run-base-tests.sh
-test.sh
-Dockerfile
-.dockerignore

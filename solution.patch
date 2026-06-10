@@ -1,0 +1,562 @@
+diff --git a/examples/src/cooperative-abort.ts b/examples/src/cooperative-abort.ts
+new file mode 100644
+index 0000000..def02df
+--- /dev/null
++++ b/examples/src/cooperative-abort.ts
+@@ -0,0 +1,47 @@
++import { Bench } from '../../src'
++
++/**
++ * Demonstrates cooperative task cancellation via `cooperativeAbortTimeout`.
++ *
++ * Each iteration receives a fresh AbortSignal. Two conditions fire it:
++ *  - The task's external abort signal fires synchronously during an iteration.
++ *  - The iteration exceeds `cooperativeAbortTimeout` milliseconds (async only).
++ *
++ * When the timer fires the task emits a 'cooperative-abort' event.
++ */
++
++const bench = new Bench({
++  cooperativeAbortTimeout: 100, // abort slow iterations after 100 ms
++  iterations: 3,
++  time: 0,
++  warmup: false,
++})
++
++bench.add('fast task', async (_signal) => {
++  // Completes well within the 100 ms timeout — signal never fires.
++  await new Promise<void>(resolve => setTimeout(resolve, 10))
++})
++
++bench.add('slow task', async (signal) => {
++  // Would run 500 ms, but the cooperative signal fires at ~100 ms.
++  await new Promise<void>((resolve) => {
++    const fallback = setTimeout(resolve, 500)
++    signal?.addEventListener('abort', () => {
++      clearTimeout(fallback)
++      resolve()
++    }, { once: true })
++    if (signal?.aborted) {
++      clearTimeout(fallback)
++      resolve()
++    }
++  })
++})
++
++for (const task of bench.tasks) {
++  task.addEventListener('cooperative-abort', () => {
++    console.log(`cooperative-abort fired on: ${task.name}`)
++  })
++}
++
++await bench.run()
++console.table(bench.table())
+diff --git a/src/bench.ts b/src/bench.ts
+index 608dfc0..5cef70e 100644
+--- a/src/bench.ts
++++ b/src/bench.ts
+@@ -40,6 +40,11 @@ export class Bench extends EventTarget implements BenchLike {
+     options?: AddEventListenerOptionsArgument
+   ) => void
+ 
++  /**
++   * Cooperative abort timeout in milliseconds (0 = disabled).
++   */
++  readonly cooperativeAbortTimeout: number
++
+   /**
+    * Executes tasks concurrently based on the specified concurrency mode.
+    *
+@@ -196,6 +201,14 @@ export class Bench extends EventTarget implements BenchLike {
+     this.signal = restOptions.signal
+     this.retainSamples = restOptions.retainSamples === true
+ 
++    const cooperativeAbortTimeout = restOptions.cooperativeAbortTimeout ?? 0
++    if (!Number.isFinite(cooperativeAbortTimeout) || cooperativeAbortTimeout < 0) {
++      throw new RangeError(
++        `cooperativeAbortTimeout must be a non-negative finite number (got ${String(cooperativeAbortTimeout)})`
++      )
++    }
++    this.cooperativeAbortTimeout = cooperativeAbortTimeout
++
+     if (this.signal) {
+       this.signal.addEventListener(
+         'abort',
+diff --git a/src/task.ts b/src/task.ts
+index 6fefbd8..47a9fe1 100644
+--- a/src/task.ts
++++ b/src/task.ts
+@@ -106,6 +106,22 @@ export class Task extends EventTarget {
+    */
+   #aborted = false
+ 
++  /**
++   * Set of per-iteration cooperative AbortControllers that are currently
++   * in-flight. Created fresh for each iteration when cooperativeAbortTimeout > 0
++   * (sequential path). Aborted synchronously by #onAbort() and cleared on reset().
++   */
++  #activeCoopControllers = new Set<AbortController>()
++
++  /**
++   * Per-iteration cooperative timeout handles that are currently pending
++   * (sequential async path). Tracked so an external abort can synchronously
++   * cancel them via #onAbort(); otherwise a long-running, externally-aborted
++   * iteration would later fire its timer and emit a spurious
++   * `cooperative-abort` event, which is reserved for timeout-driven aborts.
++   */
++  #activeCoopTimers = new Set<ReturnType<typeof setTimeout>>()
++
+   /**
+    * The task asynchronous status
+    */
+@@ -216,6 +232,14 @@ export class Task extends EventTarget {
+    * @param emit - whether to emit the `reset` event or not
+    */
+   reset (emit = true): void {
++    for (const ctrl of this.#activeCoopControllers) {
++      ctrl.abort()
++    }
++    this.#activeCoopControllers.clear()
++    for (const timer of this.#activeCoopTimers) {
++      clearTimeout(timer)
++    }
++    this.#activeCoopTimers.clear()
+     this.#runs = 0
+     this.#result = this.#aborted ? abortedTaskResult : notStartedTaskResult
+ 
+@@ -349,7 +373,10 @@ export class Task extends EventTarget {
+       let totalTime = 0 // ms
+       const samples: number[] = []
+ 
+-      const benchmarkTask = async () => {
++      // Accept an optional cooperative signal provided by withConcurrency in
++      // concurrency:'task' mode; undefined in the sequential path causes
++      // #measure / #measureSync to create their own per-iteration controller.
++      const benchmarkTask = async (coopSignal?: AbortSignal) => {
+         if (this.#aborted) {
+           return
+         }
+@@ -359,8 +386,8 @@ export class Task extends EventTarget {
+           }
+ 
+           const taskTime = this.#async
+-            ? await this.#measure()
+-            : this.#measureSync()
++            ? await this.#measure(coopSignal)
++            : this.#measureSync(coopSignal)
+ 
+           samples.push(taskTime)
+           totalTime += taskTime
+@@ -373,10 +400,18 @@ export class Task extends EventTarget {
+ 
+       if (this.#bench.concurrency === 'task') {
+         await withConcurrency({
++          cooperativeAbortTimeout: this.#bench.cooperativeAbortTimeout ?? 0,
+           fn: benchmarkTask,
+           iterations,
+           limit: Math.max(1, Math.floor(this.#bench.threshold)),
+-          signal: this.#signal ?? this.#bench.signal,
++          onCooperativeAbort: () => {
++            this.dispatchEvent(new BenchEvent('cooperative-abort', this))
++            this.#bench.dispatchEvent(new BenchEvent('cooperative-abort', this))
++          },
++          // Wire BOTH upstream signals: a task-level and a bench-level signal
++          // can each independently cancel the run, and either one must
++          // synchronously abort the in-flight cooperative signals.
++          signals: [this.#signal, this.#bench.signal],
+           time,
+           timestampProvider: this.#timestampProvider,
+         })
+@@ -475,52 +510,128 @@ export class Task extends EventTarget {
+ 
+   /**
+    * Measures a single execution of the task function asynchronously.
++   * When called without an external cooperative signal (sequential path),
++   * creates its own per-iteration AbortController and starts a timer for
++   * `cooperativeAbortTimeout` ms. When the timer fires, the signal is aborted
++   * and a `'cooperative-abort'` event is dispatched on the task.
++   * When called with an external signal (concurrent path via withConcurrency),
++   * the provided signal is used directly.
++   * @param externalCoopSignal - cooperative AbortSignal provided by withConcurrency (concurrent path)
+    * @returns The measured execution time
+    */
+-  async #measure (): Promise<number> {
+-    const taskStart = this.#timestampFn() as unknown as number
+-    // eslint-disable-next-line no-useless-call
+-    const fnResult = await this.#fn.call(this)
+-    const taskTime = this.#timestampToMs(
+-      (this.#timestampFn() as unknown as number) - taskStart
+-    )
++  async #measure (externalCoopSignal?: AbortSignal): Promise<number> {
++    const cooperativeAbortTimeout = this.#bench.cooperativeAbortTimeout ?? 0
++    let iterCtrl: AbortController | undefined
++    let timer: ReturnType<typeof setTimeout> | undefined
++    let coopSignal = externalCoopSignal
++
++    // In the sequential path no external signal is provided — create our own
++    // per-iteration controller and start the cooperative timeout timer.
++    if (coopSignal === undefined && cooperativeAbortTimeout > 0) {
++      iterCtrl = new AbortController()
++      this.#activeCoopControllers.add(iterCtrl)
++      coopSignal = iterCtrl.signal
++      timer = setTimeout(() => {
++        iterCtrl!.abort() // eslint-disable-line @typescript-eslint/no-non-null-assertion
++        this.#activeCoopControllers.delete(iterCtrl!) // eslint-disable-line @typescript-eslint/no-non-null-assertion
++        this.#activeCoopTimers.delete(timer!) // eslint-disable-line @typescript-eslint/no-non-null-assertion
++        // Notify listeners that this iteration's cooperative signal was fired
++        // by the timeout (not by an external hard abort).
++        const ev = new BenchEvent('cooperative-abort', this)
++        this.dispatchEvent(ev)
++        this.#bench.dispatchEvent(ev)
++      }, cooperativeAbortTimeout)
++      this.#activeCoopTimers.add(timer)
++    }
++
++    try {
++      const taskStart = this.#timestampFn() as unknown as number
++      // eslint-disable-next-line no-useless-call
++      const fnResult = await this.#fn.call(this, coopSignal)
++      const taskTime = this.#timestampToMs(
++        (this.#timestampFn() as unknown as number) - taskStart
++      )
+ 
+-    const overriddenDuration = getOverriddenDurationFromFnResult(fnResult)
+-    if (overriddenDuration !== undefined) {
+-      return overriddenDuration
++      const overriddenDuration = getOverriddenDurationFromFnResult(fnResult)
++      if (overriddenDuration !== undefined) {
++        return overriddenDuration
++      }
++      return taskTime
++    } finally {
++      if (timer !== undefined) {
++        clearTimeout(timer)
++        this.#activeCoopTimers.delete(timer)
++      }
++      if (iterCtrl !== undefined) this.#activeCoopControllers.delete(iterCtrl)
+     }
+-    return taskTime
+   }
+ 
+   /**
+    * Measures a single execution of the task function synchronously.
++   * Creates a fresh per-iteration AbortController for each call so that each
++   * synchronous iteration receives an independent, non-pre-aborted signal.
++   * No timer is started — timers cannot fire during synchronous execution —
++   * but `#onAbort()` can still abort the controller synchronously if the
++   * task's abort signal fires from within the handler itself.
++   * @param externalCoopSignal - cooperative AbortSignal provided externally (reserved for future use)
+    * @returns The measured execution time
+    */
+-  #measureSync (): number {
+-    const taskStart = this.#timestampFn() as unknown as number
+-    // eslint-disable-next-line no-useless-call
+-    const fnResult = this.#fn.call(this)
+-    const taskTime = this.#timestampToMs(
+-      (this.#timestampFn() as unknown as number) - taskStart
+-    )
++  #measureSync (externalCoopSignal?: AbortSignal): number {
++    const cooperativeAbortTimeout = this.#bench.cooperativeAbortTimeout ?? 0
++    let iterCtrl: AbortController | undefined
++    let coopSignal = externalCoopSignal
++
++    if (coopSignal === undefined && cooperativeAbortTimeout > 0) {
++      iterCtrl = new AbortController()
++      this.#activeCoopControllers.add(iterCtrl)
++      coopSignal = iterCtrl.signal
++      // No timer: setTimeout cannot fire during synchronous execution.
++      // The signal can still be aborted synchronously by #onAbort() if the
++      // handler itself triggers the task's abort signal.
++    }
+ 
+-    assert(
+-      !isPromiseLike(fnResult),
+-      'task function must be sync when using `runSync()`'
+-    )
+-    const overriddenDuration = getOverriddenDurationFromFnResult(fnResult)
+-    if (overriddenDuration !== undefined) {
+-      return overriddenDuration
++    try {
++      const taskStart = this.#timestampFn() as unknown as number
++      // eslint-disable-next-line no-useless-call
++      const fnResult = this.#fn.call(this, coopSignal)
++      const taskTime = this.#timestampToMs(
++        (this.#timestampFn() as unknown as number) - taskStart
++      )
++
++      assert(
++        !isPromiseLike(fnResult),
++        'task function must be sync when using `runSync()`'
++      )
++      const overriddenDuration = getOverriddenDurationFromFnResult(fnResult)
++      if (overriddenDuration !== undefined) {
++        return overriddenDuration
++      }
++      return taskTime
++    } finally {
++      if (iterCtrl !== undefined) this.#activeCoopControllers.delete(iterCtrl)
+     }
+-    return taskTime
+   }
+ 
+   /**
+    * Handles the abort event from either the task-level or bench-level signal.
+-   * Sets the task result to aborted if the task is in an abortable state.
++   * Synchronously aborts all in-flight per-iteration cooperative controllers,
++   * then sets the task result to aborted if the task is in an abortable state.
+    */
+   #onAbort (): void {
+     this.#aborted = true
++    // Synchronously abort every in-flight per-iteration cooperative controller
++    // so handlers can observe the abort with zero awaits.
++    for (const ctrl of this.#activeCoopControllers) {
++      ctrl.abort()
++    }
++    this.#activeCoopControllers.clear()
++    // Cancel any pending cooperative timeout handles. An external abort is not
++    // a timeout, so it must not be able to emit a (timeout-only)
++    // `cooperative-abort` event later — even if the iteration keeps running.
++    for (const timer of this.#activeCoopTimers) {
++      clearTimeout(timer)
++    }
++    this.#activeCoopTimers.clear()
+     if (
+       abortableStates.includes(
+         this.#result.state as (typeof abortableStates)[number]
+diff --git a/src/types.ts b/src/types.ts
+index 3ca5310..00039e8 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -17,6 +17,7 @@ export type BenchEvents =
+   | 'abort' // when a signal aborts
+   | 'add' // when a task gets added to the Bench instance
+   | 'complete' // when running a benchmark finishes
++  | 'cooperative-abort' // when a cooperative timer expires mid-iteration
+   | 'cycle' // when running each benchmark task gets done
+   | 'error' // when the benchmark task throws
+   | 'remove' // when a task gets removed of the Bench instance
+@@ -41,7 +42,7 @@ export type BenchEventsWithError = Extract<BenchEvents, 'error'>
+  */
+ export type BenchEventsWithTask = Extract<
+   BenchEvents,
+-  'add' | 'cycle' | 'error' | 'remove'
++  'add' | 'cooperative-abort' | 'cycle' | 'error' | 'remove'
+ >
+ 
+ /**
+@@ -82,6 +83,13 @@ export interface BenchLike extends EventTarget {
+     options?: RemoveEventListenerOptionsArgument
+   ) => void
+ 
++  /**
++   * Cooperative abort timeout in milliseconds. When > 0, a cooperative
++   * AbortSignal is passed as the first argument to each task function.
++   * When the task's abort signal fires, the cooperative signal fires too.
++   */
++  cooperativeAbortTimeout?: number
++
+   /**
+    * Should samples be retained for further custom processing
+    */
+@@ -229,6 +237,16 @@ export interface BenchOptions {
+    * @default 250
+    */
+   warmupTime?: number
++
++  /**
++   * Cooperative abort timeout in milliseconds.
++   * When set to a value > 0, a cooperative AbortSignal is passed as the
++   * first argument to each task function and is aborted when the task's
++   * abort signal fires.
++   * A value of 0 disables cooperative cancellation.
++   * Negative or non-finite values throw a RangeError at construction time.
++   */
++  cooperativeAbortTimeout?: number
+ }
+ 
+ /**
+@@ -277,7 +295,7 @@ export interface EventListenerObject<
+  * object with a `overriddenDuration` field. You should still use
+  * `bench.opts.now()` to measure that duration.
+  */
+-export type Fn = () =>
++export type Fn = (signal?: AbortSignal) =>
+   | FnReturnedObject
+   // eslint-disable-next-line @typescript-eslint/no-redundant-type-constituents
+   | Promise<FnReturnedObject | unknown>
+@@ -533,6 +551,7 @@ export type TaskEvents = Extract<
+   BenchEvents,
+   | 'abort' // when a signal aborts
+   | 'complete' // when running a task finishes
++  | 'cooperative-abort' // when a cooperative timer expires mid-iteration
+   | 'cycle' // when running a task gets done
+   | 'error' // when the task throws
+   | 'reset' // when the reset method gets called
+diff --git a/src/utils.ts b/src/utils.ts
+index faa883e..b191dcf 100644
+--- a/src/utils.ts
++++ b/src/utils.ts
+@@ -534,9 +534,17 @@ export const defaultConvertTaskResultForConsoleTable: ConsoleTableConverter = (
+ 
+ interface WithConcurrencyOptions<R> {
+   /**
+-   * The function to execute concurrently.
++   * Cooperative abort timeout in milliseconds. When > 0, each concurrent
++   * invocation receives its own per-call AbortSignal that fires after this
++   * many milliseconds. The signal is also fired for all in-flight calls when
++   * the overall `signal` is aborted.
+    */
+-  fn: () => Promise<R>
++  cooperativeAbortTimeout?: number
++  /**
++   * The function to execute concurrently. Receives a per-call cooperative
++   * AbortSignal when `cooperativeAbortTimeout` is set, otherwise undefined.
++   */
++  fn: (signal?: AbortSignal) => Promise<R>
+   /**
+    * The number of iterations to execute. If 0, runs until time limit is reached.
+    */
+@@ -545,10 +553,23 @@ interface WithConcurrencyOptions<R> {
+    * The maximum number of concurrent executions.
+    */
+   limit: number
++  /**
++   * Optional callback invoked each time a cooperative per-iteration timer
++   * fires. The caller can use this to dispatch events on the owning task.
++   */
++  onCooperativeAbort?: () => void
+   /**
+    * An optional AbortSignal to cancel the execution.
+    */
+   signal?: AbortSignal
++  /**
++   * Optional additional AbortSignals to cancel the execution. Every provided
++   * signal (from both `signal` and `signals`) is wired so that ANY of them
++   * aborting synchronously aborts every in-flight cooperative signal. This is
++   * required when both a task-level and a bench-level signal can independently
++   * cancel the run.
++   */
++  signals?: (AbortSignal | undefined)[]
+   /**
+    * The maximum amount of time to run the executions in milliseconds. If 0,
+    * runs until iterations are completed.
+@@ -572,10 +593,13 @@ export const withConcurrency = async <R>(
+   options: WithConcurrencyOptions<R>
+ ): Promise<R[]> => {
+   const {
++    cooperativeAbortTimeout = 0,
+     fn,
+     iterations,
+     limit,
++    onCooperativeAbort,
+     signal,
++    signals,
+     time = 0,
+     timestampProvider = performanceNowTimestampProvider,
+   } = options
+@@ -591,6 +615,7 @@ export const withConcurrency = async <R>(
+ 
+   const hasTimeLimit = Number.isFinite(time) && time > 0
+   const hasIterationsLimit = iterations > 0
++  const hasCoopTimeout = cooperativeAbortTimeout > 0
+   let targetTime: TimestampValue = 0
+ 
+   const timestampFn = timestampProvider.fn
+@@ -614,21 +639,75 @@ export const withConcurrency = async <R>(
+     errors.push(toError(e))
+   }
+ 
+-  const onAbort = () => (isRunning = false)
++  // Track per-call cooperative controllers so they can be aborted when the
++  // overall signal fires.
++  const inFlightControllers: Set<AbortController> = hasCoopTimeout
++    ? new Set()
++    : (undefined as unknown as Set<AbortController>)
++
++  // Track the per-call timeout handles alongside their controllers so an
++  // external abort can synchronously cancel any pending timer. Without this a
++  // long-running, externally-aborted iteration would later fire its timer and
++  // emit a spurious cooperative-abort (which is reserved for timeout aborts).
++  const inFlightTimers: Set<ReturnType<typeof setTimeout>> = hasCoopTimeout
++    ? new Set()
++    : (undefined as unknown as Set<ReturnType<typeof setTimeout>>)
++
++  const onAbort = () => {
++    isRunning = false
++    if (hasCoopTimeout) {
++      for (const ctrl of inFlightControllers) ctrl.abort()
++      inFlightControllers.clear()
++      for (const timer of inFlightTimers) clearTimeout(timer)
++      inFlightTimers.clear()
++    }
++  }
+ 
+-  if (signal) {
+-    if (signal.aborted) return []
+-    signal.addEventListener('abort', onAbort)
++  // Wire every distinct upstream signal so that ANY of them aborting cancels
++  // the run and the in-flight cooperative signals. Deduplicate to avoid
++  // registering the same listener twice (e.g. when the task signal and the
++  // bench signal are the same object).
++  const abortSignals = [
++    ...new Set(
++      [signal, ...(signals ?? [])].filter(
++        (s): s is AbortSignal => s != null
++      )
++    ),
++  ]
++  for (const s of abortSignals) {
++    if (s.aborted) return []
++    s.addEventListener('abort', onAbort)
+   }
+ 
+   const worker = async () => {
+     while (doNext()) {
++      let iterCtrl: AbortController | undefined
++      let timer: ReturnType<typeof setTimeout> | undefined
++
++      if (hasCoopTimeout) {
++        iterCtrl = new AbortController()
++        inFlightControllers.add(iterCtrl)
++        timer = setTimeout(() => {
++          iterCtrl!.abort() // eslint-disable-line @typescript-eslint/no-non-null-assertion
++          inFlightControllers.delete(iterCtrl!) // eslint-disable-line @typescript-eslint/no-non-null-assertion
++          inFlightTimers.delete(timer!) // eslint-disable-line @typescript-eslint/no-non-null-assertion
++          onCooperativeAbort?.()
++        }, cooperativeAbortTimeout)
++        inFlightTimers.add(timer)
++      }
++
+       try {
+-        pushResult(await fn())
++        pushResult(await fn(iterCtrl?.signal))
+       } catch (err) {
+         isRunning = false
+         pushError(err)
+         break
++      } finally {
++        if (timer !== undefined) {
++          clearTimeout(timer)
++          inFlightTimers.delete(timer)
++        }
++        if (iterCtrl !== undefined) inFlightControllers.delete(iterCtrl)
+       }
+     }
+   }
+@@ -637,8 +716,14 @@ export const withConcurrency = async <R>(
+     targetTime =
+       (timestampFn() as number) + (timestampProvider.fromMs(time) as number)
+   }
+-  const promises = Array.from({ length: maxWorkers }, () => worker())
+-  await Promise.allSettled(promises)
++  try {
++    const promises = Array.from({ length: maxWorkers }, () => worker())
++    await Promise.allSettled(promises)
++  } finally {
++    // Detach listeners so we never hold a reference on long-lived upstream
++    // signals (e.g. the bench signal) after this run completes.
++    for (const s of abortSignals) s.removeEventListener('abort', onAbort)
++  }
+ 
+   if (errors.length === 0) return results
+   if (errors.length === 1) throw errors[0] // eslint-disable-line @typescript-eslint/only-throw-error

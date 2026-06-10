@@ -17,6 +17,7 @@ export type BenchEvents =
   | 'abort' // when a signal aborts
   | 'add' // when a task gets added to the Bench instance
   | 'complete' // when running a benchmark finishes
+  | 'cooperative-abort' // when a cooperative timer expires mid-iteration
   | 'cycle' // when running each benchmark task gets done
   | 'error' // when the benchmark task throws
   | 'remove' // when a task gets removed of the Bench instance
@@ -41,7 +42,7 @@ export type BenchEventsWithError = Extract<BenchEvents, 'error'>
  */
 export type BenchEventsWithTask = Extract<
   BenchEvents,
-  'add' | 'cycle' | 'error' | 'remove'
+  'add' | 'cooperative-abort' | 'cycle' | 'error' | 'remove'
 >
 
 /**
@@ -65,9 +66,16 @@ export interface BenchLike extends EventTarget {
    */
   concurrency: Concurrency
   /**
+   * Cooperative abort timeout in milliseconds. When > 0, a cooperative
+   * AbortSignal is passed as the first argument to each task function.
+   * When the task's abort signal fires, the cooperative signal fires too.
+   */
+  cooperativeAbortTimeout?: number
+  /**
    * The amount of executions per task.
    */
   iterations: number
+
   /**
    * A function to get a timestamp.
    */
@@ -150,6 +158,16 @@ export interface BenchOptions {
    * - When `mode` is set to 'bench', different tasks within the bench run concurrently.
    */
   concurrency?: Concurrency
+
+  /**
+   * Cooperative abort timeout in milliseconds.
+   * When set to a value > 0, a cooperative AbortSignal is passed as the
+   * first argument to each task function and is aborted when the task's
+   * abort signal fires.
+   * A value of 0 disables cooperative cancellation.
+   * Negative or non-finite values throw a RangeError at construction time.
+   */
+  cooperativeAbortTimeout?: number
 
   /**
    * The number of times that a task should run if even the time option is finished.
@@ -277,7 +295,7 @@ export interface EventListenerObject<
  * object with a `overriddenDuration` field. You should still use
  * `bench.opts.now()` to measure that duration.
  */
-export type Fn = () =>
+export type Fn = (signal?: AbortSignal) =>
   | FnReturnedObject
   // eslint-disable-next-line @typescript-eslint/no-redundant-type-constituents
   | Promise<FnReturnedObject | unknown>
@@ -533,6 +551,7 @@ export type TaskEvents = Extract<
   BenchEvents,
   | 'abort' // when a signal aborts
   | 'complete' // when running a task finishes
+  | 'cooperative-abort' // when a cooperative timer expires mid-iteration
   | 'cycle' // when running a task gets done
   | 'error' // when the task throws
   | 'reset' // when the reset method gets called

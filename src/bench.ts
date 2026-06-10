@@ -50,6 +50,11 @@ export class Bench extends EventTarget implements BenchLike {
   readonly concurrency: 'bench' | 'task' | null
 
   /**
+   * Cooperative abort timeout in milliseconds (0 = disabled).
+   */
+  readonly cooperativeAbortTimeout: number
+
+  /**
    * The amount of executions per task.
    */
   readonly iterations: number
@@ -195,6 +200,14 @@ export class Bench extends EventTarget implements BenchLike {
     this.throws = restOptions.throws ?? false
     this.signal = restOptions.signal
     this.retainSamples = restOptions.retainSamples === true
+
+    const cooperativeAbortTimeout = restOptions.cooperativeAbortTimeout ?? 0
+    if (!Number.isFinite(cooperativeAbortTimeout) || cooperativeAbortTimeout < 0) {
+      throw new RangeError(
+        `cooperativeAbortTimeout must be a non-negative finite number (got ${String(cooperativeAbortTimeout)})`
+      )
+    }
+    this.cooperativeAbortTimeout = cooperativeAbortTimeout
 
     if (this.signal) {
       this.signal.addEventListener(

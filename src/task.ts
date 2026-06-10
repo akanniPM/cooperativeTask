@@ -107,6 +107,22 @@ export class Task extends EventTarget {
   #aborted = false
 
   /**
+   * Set of per-iteration cooperative AbortControllers that are currently
+   * in-flight. Created fresh for each iteration when cooperativeAbortTimeout > 0
+   * (sequential path). Aborted synchronously by #onAbort() and cleared on reset().
+   */
+  #activeCoopControllers = new Set<AbortController>()
+
+  /**
+   * Per-iteration cooperative timeout handles that are currently pending
+   * (sequential async path). Tracked so an external abort can synchronously
+   * cancel them via #onAbort(); otherwise a long-running, externally-aborted
+   * iteration would later fire its timer and emit a spurious
+   * `cooperative-abort` event, which is reserved for timeout-driven aborts.
+   */
+  #activeCoopTimers = new Set<ReturnType<typeof setTimeout>>()
+
+  /**
    * The task asynchronous status
    */
   readonly #async: boolean
@@ -216,6 +232,14 @@ export class Task extends EventTarget {
    * @param emit - whether to emit the `reset` event or not
    */
   reset (emit = true): void {
+    for (const ctrl of this.#activeCoopControllers) {
+      ctrl.abort()
+    }
+    this.#activeCoopControllers.clear()
+    for (const timer of this.#activeCoopTimers) {
+      clearTimeout(timer)
+    }
+    this.#activeCoopTimers.clear()
     this.#runs = 0
     this.#result = this.#aborted ? abortedTaskResult : notStartedTaskResult
 
@@ -349,7 +373,10 @@ export class Task extends EventTarget {
       let totalTime = 0 // ms
       const samples: number[] = []
 
-      const benchmarkTask = async () => {
+      // Accept an optional cooperative signal provided by withConcurrency in
+      // concurrency:'task' mode; undefined in the sequential path causes
+      // #measure / #measureSync to create their own per-iteration controller.
+      const benchmarkTask = async (coopSignal?: AbortSignal) => {
         if (this.#aborted) {
           return
         }
@@ -359,8 +386,8 @@ export class Task extends EventTarget {
           }
 
           const taskTime = this.#async
-            ? await this.#measure()
-            : this.#measureSync()
+            ? await this.#measure(coopSignal)
+            : this.#measureSync(coopSignal)
 
           samples.push(taskTime)
           totalTime += taskTime
@@ -373,10 +400,18 @@ export class Task extends EventTarget {
 
       if (this.#bench.concurrency === 'task') {
         await withConcurrency({
+          cooperativeAbortTimeout: this.#bench.cooperativeAbortTimeout ?? 0,
           fn: benchmarkTask,
           iterations,
           limit: Math.max(1, Math.floor(this.#bench.threshold)),
-          signal: this.#signal ?? this.#bench.signal,
+          onCooperativeAbort: () => {
+            this.dispatchEvent(new BenchEvent('cooperative-abort', this))
+            this.#bench.dispatchEvent(new BenchEvent('cooperative-abort', this))
+          },
+          // Wire BOTH upstream signals: a task-level and a bench-level signal
+          // can each independently cancel the run, and either one must
+          // synchronously abort the in-flight cooperative signals.
+          signals: [this.#signal, this.#bench.signal],
           time,
           timestampProvider: this.#timestampProvider,
         })
@@ -475,52 +510,128 @@ export class Task extends EventTarget {
 
   /**
    * Measures a single execution of the task function asynchronously.
+   * When called without an external cooperative signal (sequential path),
+   * creates its own per-iteration AbortController and starts a timer for
+   * `cooperativeAbortTimeout` ms. When the timer fires, the signal is aborted
+   * and a `'cooperative-abort'` event is dispatched on the task.
+   * When called with an external signal (concurrent path via withConcurrency),
+   * the provided signal is used directly.
+   * @param externalCoopSignal - cooperative AbortSignal provided by withConcurrency (concurrent path)
    * @returns The measured execution time
    */
-  async #measure (): Promise<number> {
-    const taskStart = this.#timestampFn() as unknown as number
-    // eslint-disable-next-line no-useless-call
-    const fnResult = await this.#fn.call(this)
-    const taskTime = this.#timestampToMs(
-      (this.#timestampFn() as unknown as number) - taskStart
-    )
+  async #measure (externalCoopSignal?: AbortSignal): Promise<number> {
+    const cooperativeAbortTimeout = this.#bench.cooperativeAbortTimeout ?? 0
+    let iterCtrl: AbortController | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let coopSignal = externalCoopSignal
 
-    const overriddenDuration = getOverriddenDurationFromFnResult(fnResult)
-    if (overriddenDuration !== undefined) {
-      return overriddenDuration
+    // In the sequential path no external signal is provided — create our own
+    // per-iteration controller and start the cooperative timeout timer.
+    if (coopSignal === undefined && cooperativeAbortTimeout > 0) {
+      iterCtrl = new AbortController()
+      this.#activeCoopControllers.add(iterCtrl)
+      coopSignal = iterCtrl.signal
+      timer = setTimeout(() => {
+        iterCtrl!.abort() // eslint-disable-line @typescript-eslint/no-non-null-assertion
+        this.#activeCoopControllers.delete(iterCtrl!) // eslint-disable-line @typescript-eslint/no-non-null-assertion
+        this.#activeCoopTimers.delete(timer!) // eslint-disable-line @typescript-eslint/no-non-null-assertion
+        // Notify listeners that this iteration's cooperative signal was fired
+        // by the timeout (not by an external hard abort).
+        const ev = new BenchEvent('cooperative-abort', this)
+        this.dispatchEvent(ev)
+        this.#bench.dispatchEvent(ev)
+      }, cooperativeAbortTimeout)
+      this.#activeCoopTimers.add(timer)
     }
-    return taskTime
+
+    try {
+      const taskStart = this.#timestampFn() as unknown as number
+      // eslint-disable-next-line no-useless-call
+      const fnResult = await this.#fn.call(this, coopSignal)
+      const taskTime = this.#timestampToMs(
+        (this.#timestampFn() as unknown as number) - taskStart
+      )
+
+      const overriddenDuration = getOverriddenDurationFromFnResult(fnResult)
+      if (overriddenDuration !== undefined) {
+        return overriddenDuration
+      }
+      return taskTime
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer)
+        this.#activeCoopTimers.delete(timer)
+      }
+      if (iterCtrl !== undefined) this.#activeCoopControllers.delete(iterCtrl)
+    }
   }
 
   /**
    * Measures a single execution of the task function synchronously.
+   * Creates a fresh per-iteration AbortController for each call so that each
+   * synchronous iteration receives an independent, non-pre-aborted signal.
+   * No timer is started — timers cannot fire during synchronous execution —
+   * but `#onAbort()` can still abort the controller synchronously if the
+   * task's abort signal fires from within the handler itself.
+   * @param externalCoopSignal - cooperative AbortSignal provided externally (reserved for future use)
    * @returns The measured execution time
    */
-  #measureSync (): number {
-    const taskStart = this.#timestampFn() as unknown as number
-    // eslint-disable-next-line no-useless-call
-    const fnResult = this.#fn.call(this)
-    const taskTime = this.#timestampToMs(
-      (this.#timestampFn() as unknown as number) - taskStart
-    )
+  #measureSync (externalCoopSignal?: AbortSignal): number {
+    const cooperativeAbortTimeout = this.#bench.cooperativeAbortTimeout ?? 0
+    let iterCtrl: AbortController | undefined
+    let coopSignal = externalCoopSignal
 
-    assert(
-      !isPromiseLike(fnResult),
-      'task function must be sync when using `runSync()`'
-    )
-    const overriddenDuration = getOverriddenDurationFromFnResult(fnResult)
-    if (overriddenDuration !== undefined) {
-      return overriddenDuration
+    if (coopSignal === undefined && cooperativeAbortTimeout > 0) {
+      iterCtrl = new AbortController()
+      this.#activeCoopControllers.add(iterCtrl)
+      coopSignal = iterCtrl.signal
+      // No timer: setTimeout cannot fire during synchronous execution.
+      // The signal can still be aborted synchronously by #onAbort() if the
+      // handler itself triggers the task's abort signal.
     }
-    return taskTime
+
+    try {
+      const taskStart = this.#timestampFn() as unknown as number
+      // eslint-disable-next-line no-useless-call
+      const fnResult = this.#fn.call(this, coopSignal)
+      const taskTime = this.#timestampToMs(
+        (this.#timestampFn() as unknown as number) - taskStart
+      )
+
+      assert(
+        !isPromiseLike(fnResult),
+        'task function must be sync when using `runSync()`'
+      )
+      const overriddenDuration = getOverriddenDurationFromFnResult(fnResult)
+      if (overriddenDuration !== undefined) {
+        return overriddenDuration
+      }
+      return taskTime
+    } finally {
+      if (iterCtrl !== undefined) this.#activeCoopControllers.delete(iterCtrl)
+    }
   }
 
   /**
    * Handles the abort event from either the task-level or bench-level signal.
-   * Sets the task result to aborted if the task is in an abortable state.
+   * Synchronously aborts all in-flight per-iteration cooperative controllers,
+   * then sets the task result to aborted if the task is in an abortable state.
    */
   #onAbort (): void {
     this.#aborted = true
+    // Synchronously abort every in-flight per-iteration cooperative controller
+    // so handlers can observe the abort with zero awaits.
+    for (const ctrl of this.#activeCoopControllers) {
+      ctrl.abort()
+    }
+    this.#activeCoopControllers.clear()
+    // Cancel any pending cooperative timeout handles. An external abort is not
+    // a timeout, so it must not be able to emit a (timeout-only)
+    // `cooperative-abort` event later — even if the iteration keeps running.
+    for (const timer of this.#activeCoopTimers) {
+      clearTimeout(timer)
+    }
+    this.#activeCoopTimers.clear()
     if (
       abortableStates.includes(
         this.#result.state as (typeof abortableStates)[number]

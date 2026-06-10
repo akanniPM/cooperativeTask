@@ -1,0 +1,1384 @@
+/**
+ * Tests for cooperative task cancellation.
+ *
+ * Feature spec: when a Bench is configured with `cooperativeAbortTimeout > 0`,
+ * the benchmark function receives an AbortSignal as its first argument on every
+ * iteration. Two mechanisms can abort that per-iteration signal:
+ *
+ *   1. External abort — when the task's own abort signal fires while the
+ *      handler is running, the cooperative signal is aborted synchronously.
+ *
+ *   2. Timer-based abort — when an iteration runs longer than
+ *      `cooperativeAbortTimeout` milliseconds, the per-iteration signal fires
+ *      automatically via setTimeout even without any external abort signal.
+ *      This is the primary purpose of the numeric value.
+ *
+ * Each iteration must receive a fresh, independent AbortSignal instance (not a
+ * shared one reused across iterations).
+ *
+ * When the timer fires, the task dispatches a 'cooperative-abort' event so
+ * that subscribers added via task.addEventListener('cooperative-abort', …) are
+ * notified.
+ *
+ * Signal delivery must work on both bench.run() (async) and bench.runSync()
+ * (sync).
+ *
+ * All tests in this file MUST FAIL on the base code (before implementation).
+ */
+
+import { execSync } from 'node:child_process'
+import { existsSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { expect, test } from 'vitest'
+
+import { Bench } from '../src'
+
+// ---------------------------------------------------------------------------
+// Compile-time type checks — must fail if public types are not updated.
+// ---------------------------------------------------------------------------
+
+test("public type system exposes 'cooperative-abort' and AbortSignal handler signature", () => {
+  const tempTypecheckFile = join(
+    process.cwd(),
+    'test',
+    `cooperative-abort.typecheck.${String(Date.now())}.${Math.random().toString(36).slice(2)}.ts`
+  )
+
+  const snippet = [
+    "import { Bench, type Fn, type TaskEvents } from '../src'",
+    '',
+    'type Equals<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false',
+    "type HasCooperativeAbortEvent = 'cooperative-abort' extends keyof Record<TaskEvents, 1> ? true : false",
+    'type FnFirstArg = Parameters<Fn>[0]',
+    'type FnHasSignalArg = Equals<FnFirstArg, AbortSignal | undefined>',
+    'const assertTrue = <T extends true>(_value: T): void => {}',
+    'assertTrue<HasCooperativeAbortEvent>(true)',
+    'assertTrue<FnHasSignalArg>(true)',
+    '',
+    'const bench = new Bench({ cooperativeAbortTimeout: 1, iterations: 1, time: 0, warmup: false })',
+    "const task = bench.add('typed-probe', (signal?: AbortSignal) => {",
+    '  if (signal?.aborted) return',
+    '})',
+    '',
+    "task.addEventListener('cooperative-abort', () => {})",
+    '',
+  ].join('\n')
+
+  writeFileSync(tempTypecheckFile, snippet)
+
+  try {
+    execSync('pnpm exec tsc --noEmit --pretty false --skipLibCheck', {
+      stdio: 'pipe',
+    })
+  } catch (error) {
+    if (error instanceof Error && 'stdout' in error) {
+      const errorWithOutput = error as {
+        stderr?: Buffer | string
+        stdout?: Buffer | string
+      }
+      const stdout = String(errorWithOutput.stdout ?? '')
+      const stderr = String(errorWithOutput.stderr ?? '')
+      throw new Error(`Type-level gate compilation failed:\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`)
+    }
+
+    throw error
+  } finally {
+    rmSync(tempTypecheckFile, { force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Option validation — RangeError at construction time
+// ---------------------------------------------------------------------------
+
+test('throws RangeError for a negative cooperativeAbortTimeout', () => {
+  const fn = () => new Bench({ cooperativeAbortTimeout: -1 })
+  expect(fn).toThrow(RangeError)
+  expect(fn).toThrow(/cooperativeAbortTimeout/i)
+})
+
+test('throws RangeError for a NaN cooperativeAbortTimeout (non-finite)', () => {
+  const fn = () => new Bench({ cooperativeAbortTimeout: Number.NaN })
+  expect(fn).toThrow(RangeError)
+  expect(fn).toThrow(/cooperativeAbortTimeout/i)
+})
+
+test('throws RangeError for an Infinity cooperativeAbortTimeout (non-finite)', () => {
+  const fn = () => new Bench({ cooperativeAbortTimeout: Number.POSITIVE_INFINITY })
+  expect(fn).toThrow(RangeError)
+  expect(fn).toThrow(/cooperativeAbortTimeout/i)
+})
+
+// ---------------------------------------------------------------------------
+// Signal delivery — handler receives AbortSignal as first argument
+// ---------------------------------------------------------------------------
+
+test('handler receives an AbortSignal as its first argument when cooperativeAbortTimeout is configured', async () => {
+  let capturedFirstArg: unknown
+
+  const bench = new Bench({ cooperativeAbortTimeout: 100, iterations: 1, time: 0, warmup: false })
+
+  const probeFn = (signal?: AbortSignal) => {
+    capturedFirstArg = signal
+  }
+
+  bench.add('probe-task', probeFn)
+
+  await bench.run()
+
+  expect(capturedFirstArg).toBeInstanceOf(AbortSignal)
+})
+
+// ---------------------------------------------------------------------------
+// Signal semantics — cooperative signal fires synchronously when the task
+// abort fires (no microtask delay permitted)
+// ---------------------------------------------------------------------------
+
+test('cooperative signal fires synchronously when the task abort signal fires during an iteration', async () => {
+  const controller = new AbortController()
+  let observedSynchronously = false
+
+  const bench = new Bench({ cooperativeAbortTimeout: 500, iterations: 1, time: 0, warmup: false })
+
+  const signalProbeFn = (signal?: AbortSignal) => {
+    // Fire the task-level abort signal from inside the running iteration.
+    controller.abort()
+
+    // Capture the signal state with zero awaits between the trigger and the
+    // check. A microtask-delayed implementation would still show false here.
+    observedSynchronously = signal?.aborted === true
+  }
+
+  bench.add('signal-probe-task', signalProbeFn, { signal: controller.signal })
+
+  await bench.run()
+
+  expect(observedSynchronously).toBe(true)
+})
+
+// ---------------------------------------------------------------------------
+// Unaffected handlers — ignoring the signal does not break normal execution
+// ---------------------------------------------------------------------------
+
+test('handlers that ignore the cooperative signal run to completion normally', async () => {
+  let ranToCompletion = false
+  let receivedSignal = false
+
+  const bench = new Bench({ cooperativeAbortTimeout: 100, iterations: 1, time: 0, warmup: false })
+
+  // This handler notes whether it received an AbortSignal as its first
+  // argument but otherwise ignores it entirely — no abort checks, no early
+  // return, no listeners.  It must run to completion with no errors.
+  const ignoringFn = (signal?: AbortSignal) => {
+    receivedSignal = signal instanceof AbortSignal
+    ranToCompletion = true
+  }
+
+  bench.add('ignoring-task', ignoringFn)
+
+  await bench.run()
+
+  const task = bench.getTask('ignoring-task')
+  // On base code: first arg is undefined, not an AbortSignal → fails here.
+  expect(receivedSignal).toBe(true)
+  expect(ranToCompletion).toBe(true)
+  expect(task).toBeDefined()
+  if (!task) return
+  expect(task.result.state).not.toBe('errored')
+})
+
+// ---------------------------------------------------------------------------
+// Early exit — handler polls the cooperative signal and exits before the
+// fallback timeout, allowing bench.run() to resolve with exitedEarly = true.
+//
+// Without the feature: signal is undefined → handler exits via the 200 ms
+// fallback timer → exitedEarly remains false → assertion fails.
+// ---------------------------------------------------------------------------
+
+test('handler can exit early via cooperative signal, resolving bench.run() with task aborted', async () => {
+  const controller = new AbortController()
+  let exitedEarly = false
+
+  const bench = new Bench({ cooperativeAbortTimeout: 1000, iterations: 1, time: 0, warmup: false })
+
+  const earlyExitFn = async (signal?: AbortSignal) => {
+    await new Promise<void>(resolve => {
+      // Without cooperative feature: signal is undefined, resolve fires after
+      // the 200 ms fallback — exitedEarly remains false → assertion fails.
+      const fallbackTimer = setTimeout(resolve, 200)
+
+      signal?.addEventListener('abort', () => {
+        clearTimeout(fallbackTimer)
+        exitedEarly = true
+        resolve()
+      }, { once: true })
+
+      // Guard: the DOM spec does not fire 'abort' retroactively when a listener
+      // is added to an already-aborted signal. If the abort arrived before this
+      // iteration started (heavy system load), check the flag explicitly so the
+      // test is not racy. On base code s is undefined so this branch is inert.
+      if (signal?.aborted === true) {
+        clearTimeout(fallbackTimer)
+        exitedEarly = true
+        resolve()
+      }
+    })
+  }
+
+  bench.add('early-exit-task', earlyExitFn, { signal: controller.signal })
+
+  // Abort 50 ms after bench.run() begins — well within the 200 ms fallback window.
+  setTimeout(() => { controller.abort() }, 50)
+
+  await bench.run()
+
+  expect(exitedEarly).toBe(true)
+})
+
+// ---------------------------------------------------------------------------
+// Timer-based cooperative abort — the cooperativeAbortTimeout value is used
+// as an actual per-iteration timer.  No external abort signal is required.
+//
+// Without the feature (base code or partial solution with no timer):
+//   signal is undefined or never fires → handler waits the full 200 ms
+//   fallback → exitedEarly remains false → assertion fails.
+// ---------------------------------------------------------------------------
+
+test('cooperative signal fires via timer when iteration exceeds cooperativeAbortTimeout (no external abort)', async () => {
+  let exitedEarly = false
+
+  const bench = new Bench({ cooperativeAbortTimeout: 50, iterations: 1, time: 0, warmup: false })
+
+  const timerAbortFn = async (signal?: AbortSignal) => {
+    await new Promise<void>(resolve => {
+      // Without the timer: signal never fires → resolve fires after 200 ms →
+      // exitedEarly remains false → test fails.
+      const fallback = setTimeout(resolve, 200)
+
+      signal?.addEventListener('abort', () => {
+        clearTimeout(fallback)
+        exitedEarly = true
+        resolve()
+      }, { once: true })
+
+      if (signal?.aborted === true) {
+        clearTimeout(fallback)
+        exitedEarly = true
+        resolve()
+      }
+    })
+  }
+
+  bench.add('timer-abort-task', timerAbortFn)
+  // No task-level signal — only the internal timer should trigger the abort.
+  await bench.run()
+
+  expect(exitedEarly).toBe(true)
+})
+
+// ---------------------------------------------------------------------------
+// Per-iteration signal identity — each iteration must receive a fresh,
+// independent AbortSignal instance (not a single shared controller).
+//
+// On base code: no signal at all → signals.size = 0 → fails.
+// On a naive shared-controller implementation: all iterations receive the
+// same instance → signals.size = 1 → fails.
+// ---------------------------------------------------------------------------
+
+test('each iteration receives a distinct, non-pre-aborted AbortSignal instance', async () => {
+  const signals = new Set<AbortSignal>()
+  const abortedAtStart: boolean[] = []
+
+  const bench = new Bench({ cooperativeAbortTimeout: 500, iterations: 3, time: 0, warmup: false })
+
+  const distinctSignalFn = (signal?: AbortSignal) => {
+    if (signal instanceof AbortSignal) {
+      abortedAtStart.push(signal.aborted)
+      signals.add(signal)
+    }
+  }
+
+  bench.add('distinct-signals', distinctSignalFn)
+  await bench.run()
+
+  // All three iterations must deliver an AbortSignal …
+  expect(signals.size).toBe(3)
+  // … and each must start in a non-aborted state.
+  expect(abortedAtStart).toEqual([false, false, false])
+})
+
+// ---------------------------------------------------------------------------
+// runSync parity — cooperative AbortSignal must also be passed to handlers
+// executed through the synchronous path (bench.runSync / task.runSync).
+// ---------------------------------------------------------------------------
+
+test('runSync delivers cooperative AbortSignal to the handler (sync path parity)', () => {
+  let received = false
+
+  const bench = new Bench({ cooperativeAbortTimeout: 100, iterations: 1, time: 0, warmup: false })
+
+  const syncFn = (signal?: AbortSignal) => {
+    received = signal instanceof AbortSignal
+  }
+
+  bench.add('sync-signal-task', syncFn)
+  bench.runSync()
+
+  // On base code: no signal passed to fn → received = false → FAIL
+  expect(received).toBe(true)
+})
+
+// ---------------------------------------------------------------------------
+// 'cooperative-abort' event — the task must dispatch a 'cooperative-abort'
+// event (with itself as the associated task) when its per-iteration timer
+// fires during a slow handler.
+//
+// Without the feature (base code or partial solution without events/timer):
+//   no event is dispatched → eventFired remains false → assertion fails.
+// ---------------------------------------------------------------------------
+
+test("'cooperative-abort' event is dispatched on the task when the cooperative timer fires", async () => {
+  let eventFired = false
+
+  const bench = new Bench({ cooperativeAbortTimeout: 50, iterations: 1, time: 0, warmup: false })
+
+  // Slow handler: runs longer than cooperativeAbortTimeout so the timer fires.
+  const slowFn = async (_signal?: AbortSignal) => {
+    await new Promise<void>(resolve => setTimeout(resolve, 200))
+  }
+
+  bench.add('event-task', slowFn)
+
+  const task = bench.getTask('event-task')
+  expect(task).toBeDefined()
+  if (!task) return
+  // Listen for the cooperative-abort event before the run starts.
+  task.addEventListener('cooperative-abort', () => {
+    eventFired = true
+  })
+
+  await bench.run()
+
+  expect(eventFired).toBe(true)
+})
+
+// ---------------------------------------------------------------------------
+// concurrency: 'task' mode — signal delivery via withConcurrency path
+//
+// When concurrency is enabled, iterations are executed through withConcurrency
+// rather than the sequential task path. The cooperative signal must still be
+// delivered to every concurrent invocation.
+//
+// On base code: withConcurrency passes nothing as the first arg → signal is
+// undefined → received.every(Boolean) === false → assertion fails.
+// ---------------------------------------------------------------------------
+
+test("concurrency 'task' mode: each concurrent iteration receives an AbortSignal", async () => {
+  const received: boolean[] = []
+
+  const bench = new Bench({ concurrency: 'task', cooperativeAbortTimeout: 500, iterations: 3, time: 0, warmup: false })
+
+  const concurrentFn = (signal?: AbortSignal) => {
+    received.push(signal instanceof AbortSignal)
+  }
+
+  bench.add('concurrent-signal', concurrentFn)
+  await bench.run()
+
+  // All three iterations must deliver an AbortSignal.
+  expect(received).toHaveLength(3)
+  expect(received.every(Boolean)).toBe(true)
+})
+
+// ---------------------------------------------------------------------------
+// concurrency: 'task' mode — timer fires 'cooperative-abort' event
+//
+// On base code: no timer in withConcurrency path → no event → fails.
+// ---------------------------------------------------------------------------
+
+test("concurrency 'task' mode: cooperative timer fires 'cooperative-abort' event on slow iterations", async () => {
+  let eventFired = false
+
+  const bench = new Bench({ concurrency: 'task', cooperativeAbortTimeout: 50, iterations: 1, time: 0, warmup: false })
+
+  const slowConcurrentFn = async (_signal?: AbortSignal) => {
+    await new Promise<void>(resolve => setTimeout(resolve, 200))
+  }
+
+  bench.add('concurrent-event-task', slowConcurrentFn)
+
+  const task = bench.getTask('concurrent-event-task')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => {
+    eventFired = true
+  })
+
+  await bench.run()
+
+  expect(eventFired).toBe(true)
+})
+
+test("concurrency 'task' mode: emits one cooperative-abort event per timed-out iteration", async () => {
+  let eventCount = 0
+  const iterations = 4
+
+  const bench = new Bench({ concurrency: 'task', cooperativeAbortTimeout: 25, iterations, time: 0, warmup: false })
+
+  const timeoutEveryIterationFn = async (signal?: AbortSignal) => {
+    await new Promise<void>(resolve => {
+      const fallback = setTimeout(resolve, 200)
+      signal?.addEventListener('abort', () => {
+        clearTimeout(fallback)
+        resolve()
+      }, { once: true })
+      if (signal?.aborted === true) {
+        clearTimeout(fallback)
+        resolve()
+      }
+    })
+  }
+
+  bench.add('concurrent-event-count-task', timeoutEveryIterationFn)
+
+  const task = bench.getTask('concurrent-event-count-task')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => {
+    eventCount += 1
+  })
+
+  await bench.run()
+
+  // On base code: no cooperative timeout signals/events, so eventCount remains 0.
+  expect(eventCount).toBe(iterations)
+})
+
+test('timeout-based cooperative-abort is emitted before task cycle/complete', async () => {
+  const order: string[] = []
+
+  const bench = new Bench({ cooperativeAbortTimeout: 25, iterations: 1, time: 0, warmup: false })
+
+  const orderedTimeoutFn = async (signal?: AbortSignal) => {
+    await new Promise<void>(resolve => {
+      const fallback = setTimeout(resolve, 200)
+      signal?.addEventListener('abort', () => {
+        clearTimeout(fallback)
+        resolve()
+      }, { once: true })
+      if (signal?.aborted === true) {
+        clearTimeout(fallback)
+        resolve()
+      }
+    })
+  }
+
+  bench.add('event-order-timeout-task', orderedTimeoutFn)
+
+  const task = bench.getTask('event-order-timeout-task')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => order.push('cooperative-abort'))
+  task.addEventListener('cycle', () => order.push('cycle'))
+  task.addEventListener('complete', () => order.push('complete'))
+
+  await bench.run()
+
+  // On base code, cooperative-abort never appears, so this strict order fails.
+  expect(order).toEqual(['cooperative-abort', 'cycle', 'complete'])
+})
+
+// ---------------------------------------------------------------------------
+// External abort semantics — external abort must synchronously abort the
+// cooperative signal, but must NOT emit 'cooperative-abort' (timeout-only).
+// ---------------------------------------------------------------------------
+
+test("external abort aborts cooperative signal without emitting 'cooperative-abort'", async () => {
+  const controller = new AbortController()
+  let observedSignalAbort = false
+  let cooperativeAbortEventFired = false
+
+  const bench = new Bench({ cooperativeAbortTimeout: 1000, iterations: 1, time: 0, warmup: false })
+
+  const externalAbortFn = async (signal?: AbortSignal) => {
+    signal?.addEventListener('abort', () => {
+      observedSignalAbort = true
+    }, { once: true })
+
+    // Trigger external abort while the iteration is running.
+    controller.abort()
+    await Promise.resolve()
+  }
+
+  bench.add('external-abort-no-coop-event', externalAbortFn, { signal: controller.signal })
+
+  const task = bench.getTask('external-abort-no-coop-event')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => {
+    cooperativeAbortEventFired = true
+  })
+
+  await bench.run()
+
+  // On base code: no cooperative signal is passed, so this remains false.
+  expect(observedSignalAbort).toBe(true)
+  // 'cooperative-abort' is reserved for timeout-based aborts only.
+  expect(cooperativeAbortEventFired).toBe(false)
+})
+
+// ---------------------------------------------------------------------------
+// Negative sync timer assertion — synchronous execution does not trigger a
+// timer-based abort or event even if handler exceeds cooperativeAbortTimeout.
+// ---------------------------------------------------------------------------
+
+test('synchronous execution does not trigger a timer-based abort or event even if handler exceeds cooperativeAbortTimeout', () => {
+  let eventFired = false
+  let receivedSignal = false
+
+  const bench = new Bench({ cooperativeAbortTimeout: 20, iterations: 1, time: 0, warmup: false })
+
+  // Synchronous handler that sleeps/blocks for 50 ms (exceeding the 20 ms timeout)
+  const blockingFn = (signal?: AbortSignal) => {
+    receivedSignal = signal instanceof AbortSignal
+    const start = performance.now()
+    while (performance.now() - start < 50) {
+      // synchronous busy wait
+    }
+    // The cooperative signal should be present, but NOT aborted in sync execution.
+    expect(signal?.aborted).toBe(false)
+  }
+
+  bench.add('blocking-sync-task', blockingFn)
+
+  const task = bench.getTask('blocking-sync-task')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => {
+    eventFired = true
+  })
+
+  bench.runSync()
+
+  // On base code this is false because sync handlers receive no cooperative signal.
+  expect(receivedSignal).toBe(true)
+  // The timer must not apply to sync execution, so no abort event is dispatched
+  expect(eventFired).toBe(false)
+})
+
+test('sequential timeout abort fires exactly once and does not emit late cooperative-abort events after completion', async () => {
+  let eventCount = 0
+
+  const bench = new Bench({ cooperativeAbortTimeout: 30, iterations: 1, time: 0, warmup: false })
+
+  const singleTimeoutFn = async (signal?: AbortSignal) => {
+    await new Promise<void>(resolve => {
+      const fallback = setTimeout(resolve, 200)
+      signal?.addEventListener('abort', () => {
+        clearTimeout(fallback)
+        resolve()
+      }, { once: true })
+      if (signal?.aborted === true) {
+        clearTimeout(fallback)
+        resolve()
+      }
+    })
+  }
+
+  bench.add('sequential-single-timeout', singleTimeoutFn)
+
+  const task = bench.getTask('sequential-single-timeout')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => {
+    eventCount += 1
+  })
+
+  await bench.run()
+  expect(eventCount).toBe(1)
+
+  // Wait longer than the timeout to ensure no stale timers emit extra events.
+  await new Promise<void>(resolve => setTimeout(resolve, 80))
+  expect(eventCount).toBe(1)
+})
+
+// ---------------------------------------------------------------------------
+// examples/src/cooperative-abort.ts must exist and run correctly —
+// demonstrates the feature across the public API surface.
+// ---------------------------------------------------------------------------
+
+test('examples/src/cooperative-abort.ts exists as a working demonstration and runs without error', () => {
+  const filePath = join(process.cwd(), 'examples/src/cooperative-abort.ts')
+  expect(existsSync(filePath)).toBe(true)
+
+  // A working demonstration must execute successfully; exact stdout is not part of the contract.
+  execSync('pnpm --dir examples exec tsx src/cooperative-abort.ts', { stdio: 'pipe' })
+})
+
+// ===========================================================================
+// ADDED DIFFICULTY GATES
+//
+// Each test below targets a requirement that is stated in the problem
+// description but was not discriminated by the original suite. Every test:
+//   - fails on base code (it asserts the feature is actually present), and
+//   - fails a *specific* common-but-wrong implementation, while passing any
+//     correct one.
+// Timing margins are deliberately wide (sub-timeout work << timeout, and waits
+// well past the timeout) so the assertions are deterministic.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// (A) Stale-timer gate — "After a task run completes, no delayed/stale timeout
+// should be able to emit additional cooperative-abort events."
+//
+// A fast handler finishes long before the timeout. An implementation that
+// forgets to clear the per-iteration timer will let it fire after the handler
+// has already returned, aborting a finished iteration's signal AND dispatching
+// a stale 'cooperative-abort'. A correct implementation clears the timer.
+// ---------------------------------------------------------------------------
+
+test('fast async handler clears its per-iteration timer: no stale event, signal stays un-aborted', async () => {
+  let eventCount = 0
+  let receivedSignal = false
+  let capturedSignal: AbortSignal | undefined
+
+  const bench = new Bench({ cooperativeAbortTimeout: 300, iterations: 1, time: 0, warmup: false })
+
+  const fastFn = async (signal?: AbortSignal) => {
+    receivedSignal = signal instanceof AbortSignal
+    capturedSignal = signal
+    await new Promise<void>(resolve => setTimeout(resolve, 10))
+  }
+
+  bench.add('fast-clear-timer', fastFn)
+  const task = bench.getTask('fast-clear-timer')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => { eventCount += 1 })
+
+  await bench.run()
+
+  // Feature must be present — first arg is undefined on base code, failing here.
+  expect(receivedSignal).toBe(true)
+
+  // Wait well past the 300 ms timeout. A solution that left the timer pending
+  // would fire it now, producing a stale event and aborting the old signal.
+  await new Promise<void>(resolve => setTimeout(resolve, 400))
+
+  expect(eventCount).toBe(0)
+  expect(capturedSignal?.aborted).toBe(false)
+})
+
+// ---------------------------------------------------------------------------
+// (B) Per-iteration timer gate — the timeout applies to each iteration, not to
+// the whole task run. Eight iterations of ~20 ms each are individually far
+// under the 120 ms timeout (so a correct per-iteration timer never fires), but
+// the total run (~160 ms) exceeds it (so a single per-task / cumulative timer
+// would fire and dispatch at least one event).
+// ---------------------------------------------------------------------------
+
+test('cooperative timer is per-iteration, not per-task: sub-timeout iterations emit no events', async () => {
+  let eventCount = 0
+  let signalsDelivered = 0
+  const iterations = 8
+
+  const bench = new Bench({ cooperativeAbortTimeout: 120, iterations, time: 0, warmup: false })
+
+  const subTimeoutFn = async (signal?: AbortSignal) => {
+    if (signal instanceof AbortSignal) signalsDelivered += 1
+    await new Promise<void>(resolve => setTimeout(resolve, 20))
+  }
+
+  bench.add('per-iteration-timer', subTimeoutFn)
+  const task = bench.getTask('per-iteration-timer')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => { eventCount += 1 })
+
+  await bench.run()
+
+  // Base code delivers no signal at all, failing here.
+  expect(signalsDelivered).toBe(iterations)
+  // A single per-task timer fires once total time passes the timeout, failing here.
+  expect(eventCount).toBe(0)
+})
+
+// ---------------------------------------------------------------------------
+// (C) Opt-in gate — "When this option is greater than 0, every iteration must
+// receive a fresh AbortSignal." The contrapositive is part of the contract:
+// when the option is not > 0, the handler's first argument must remain
+// undefined, so existing zero-arg handlers are unaffected.
+// ---------------------------------------------------------------------------
+
+test('cooperative signal is strictly opt-in: enabled delivers a signal, disabled delivers undefined', async () => {
+  let enabledFirstArg: unknown = 'unset'
+  let disabledFirstArg: unknown = 'unset'
+
+  const enabledBench = new Bench({ cooperativeAbortTimeout: 50, iterations: 1, time: 0, warmup: false })
+  enabledBench.add('enabled-probe', (signal?: AbortSignal) => { enabledFirstArg = signal })
+  await enabledBench.run()
+
+  const disabledBench = new Bench({ cooperativeAbortTimeout: 0, iterations: 1, time: 0, warmup: false })
+  disabledBench.add('disabled-probe', (signal?: AbortSignal) => { disabledFirstArg = signal })
+  await disabledBench.run()
+
+  // Enabled path delivers a real signal — fails on base (first arg undefined).
+  expect(enabledFirstArg).toBeInstanceOf(AbortSignal)
+  // Disabled path must deliver nothing — fails any implementation that always
+  // injects a signal regardless of the opt-in value.
+  expect(disabledFirstArg).toBeUndefined()
+})
+
+// ---------------------------------------------------------------------------
+// (D) Concurrency distinctness gate — "Signals must be independent per
+// iteration and must never be reused", including concurrency: 'task'. The
+// original suite only checks per-iteration distinctness on the sequential
+// path; the concurrent path could still share one controller and pass.
+// ---------------------------------------------------------------------------
+
+test("concurrency 'task' mode: each iteration receives a distinct, non-pre-aborted signal", async () => {
+  const signals = new Set<AbortSignal>()
+  const abortedAtStart: boolean[] = []
+  const iterations = 4
+
+  const bench = new Bench({ concurrency: 'task', cooperativeAbortTimeout: 500, iterations, time: 0, warmup: false })
+
+  const collectFn = (signal?: AbortSignal) => {
+    if (signal instanceof AbortSignal) {
+      abortedAtStart.push(signal.aborted)
+      signals.add(signal)
+    }
+  }
+
+  bench.add('concurrent-distinct-signals', collectFn)
+  await bench.run()
+
+  // Base: no signal -> size 0. Shared-controller impl: size 1. Correct: size 4.
+  expect(signals.size).toBe(iterations)
+  expect(abortedAtStart).toEqual([false, false, false, false])
+})
+
+// ---------------------------------------------------------------------------
+// (E) Synchronous distinctness gate — runSync must still deliver a cooperative
+// signal ("runSync must still pass a cooperative signal when enabled"), and
+// the per-iteration independence rule ("independent per iteration and must
+// never be reused") applies on the synchronous path too. The original suite
+// only checks signal *presence* in runSync, never that each sync iteration
+// gets its own fresh signal — a shared sync controller would slip through.
+// ---------------------------------------------------------------------------
+
+test('runSync delivers a distinct, non-pre-aborted cooperative signal to each iteration', () => {
+  const signals = new Set<AbortSignal>()
+  const abortedAtStart: boolean[] = []
+  let signalledCalls = 0
+  const iterations = 3
+
+  const bench = new Bench({ cooperativeAbortTimeout: 100, iterations, time: 0, warmup: false })
+
+  const collectFn = (signal?: AbortSignal) => {
+    if (signal instanceof AbortSignal) {
+      signalledCalls += 1
+      abortedAtStart.push(signal.aborted)
+      signals.add(signal)
+    }
+  }
+
+  bench.add('sync-distinct-signals', collectFn)
+  bench.runSync()
+
+  // Base: sync handler receives no signal -> 0 signalled calls, failing here.
+  expect(signalledCalls).toBeGreaterThanOrEqual(iterations)
+  // A single shared/reused controller collapses to one entry, failing here.
+  expect(signals.size).toBe(signalledCalls)
+  // No timer fires in sync execution, so every delivered signal starts un-aborted.
+  expect(abortedAtStart.every(aborted => !aborted)).toBe(true)
+})
+
+// ---------------------------------------------------------------------------
+// (F) Bench-level external abort gate — the spec says the cooperative signal
+// aborts "if the task OR bench abort signal fires", and that external aborts
+// must NOT emit 'cooperative-abort' (that event is timeout-only). The original
+// suite only exercises the task-level signal; an implementation that wires only
+// the task signal — and ignores the bench-level one — slips through.
+// ---------------------------------------------------------------------------
+
+test('bench-level abort signal aborts the cooperative signal and emits no cooperative-abort event', async () => {
+  const benchController = new AbortController()
+  let receivedSignal = false
+  let signalAborted = false
+  let coopEvents = 0
+
+  const bench = new Bench({
+    cooperativeAbortTimeout: 1000,
+    iterations: 1,
+    signal: benchController.signal,
+    time: 0,
+    warmup: false,
+  })
+
+  const fn = async (signal?: AbortSignal) => {
+    receivedSignal = signal instanceof AbortSignal
+    signal?.addEventListener('abort', () => { signalAborted = true }, { once: true })
+    // Fire the BENCH-level abort (not the task-level one) during the iteration.
+    benchController.abort()
+    await Promise.resolve()
+  }
+
+  bench.add('bench-abort-task', fn)
+  const task = bench.getTask('bench-abort-task')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => { coopEvents += 1 })
+
+  await bench.run()
+
+  expect(receivedSignal).toBe(true) // fails on base (no signal delivered)
+  expect(signalAborted).toBe(true)  // fails if only the task-level signal is wired
+  expect(coopEvents).toBe(0)        // external abort must not emit cooperative-abort
+})
+
+// ---------------------------------------------------------------------------
+// (G) Concurrency external-abort gate — external abort must abort the in-flight
+// cooperative signal in EVERY execution mode, and must still not emit
+// 'cooperative-abort'. The concurrent path runs through withConcurrency, a
+// different code path than the sequential one; wiring external abort only on
+// the sequential path passes the existing tests but fails here.
+// ---------------------------------------------------------------------------
+
+test("concurrency 'task' mode: external abort aborts the cooperative signal without emitting cooperative-abort", async () => {
+  const controller = new AbortController()
+  let received = false
+  let signalAborted = false
+  let coopEvents = 0
+
+  const bench = new Bench({
+    concurrency: 'task',
+    cooperativeAbortTimeout: 1000,
+    iterations: 1,
+    time: 0,
+    warmup: false,
+  })
+
+  const fn = async (signal?: AbortSignal) => {
+    received = signal instanceof AbortSignal
+    signal?.addEventListener('abort', () => { signalAborted = true }, { once: true })
+    controller.abort()
+    await Promise.resolve()
+  }
+
+  bench.add('conc-external-abort', fn, { signal: controller.signal })
+  const task = bench.getTask('conc-external-abort')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => { coopEvents += 1 })
+
+  await bench.run()
+
+  expect(received).toBe(true)      // fails on base (no signal)
+  expect(signalAborted).toBe(true) // fails if the concurrent path ignores external abort
+  expect(coopEvents).toBe(0)       // timeout-only event rule
+})
+
+// ---------------------------------------------------------------------------
+// (H) Exact-count gate — "If N iterations time out, exactly N cooperative-abort
+// events must be dispatched." A mixed workload (alternating fast and slow
+// iterations) means only the slow ones cross the timeout. This is the strongest
+// counting discriminator: 'emit on every iteration' overshoots, 'one timer per
+// task' undershoots, and only a correct per-iteration timer hits the exact
+// count.
+// ---------------------------------------------------------------------------
+
+test('mixed fast and slow iterations emit exactly one cooperative-abort per timed-out iteration', async () => {
+  let events = 0
+  let signalsDelivered = 0
+  let index = 0
+  const iterations = 6
+
+  const bench = new Bench({ cooperativeAbortTimeout: 80, iterations, time: 0, warmup: false })
+
+  const mixedFn = async (signal?: AbortSignal) => {
+    if (signal instanceof AbortSignal) signalsDelivered += 1
+    const isSlow = index % 2 === 1
+    index += 1
+    if (!isSlow) {
+      // Fast iteration: ~15 ms, well under the 80 ms timeout -> timer cleared, no event.
+      await new Promise<void>(resolve => setTimeout(resolve, 15))
+      return
+    }
+    // Slow iteration: would run ~400 ms but the cooperative timer fires at 80 ms.
+    await new Promise<void>(resolve => {
+      const fallback = setTimeout(resolve, 400)
+      signal?.addEventListener('abort', () => { clearTimeout(fallback); resolve() }, { once: true })
+      if (signal?.aborted === true) { clearTimeout(fallback); resolve() }
+    })
+  }
+
+  bench.add('mixed-timeout-task', mixedFn)
+  const task = bench.getTask('mixed-timeout-task')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => { events += 1 })
+
+  await bench.run()
+
+  expect(signalsDelivered).toBe(iterations) // fails on base (no signal delivered)
+  // Exactly the 3 slow iterations (indices 1, 3, 5) time out.
+  expect(events).toBe(3)
+})
+
+// ===========================================================================
+// V2 DISCRIMINATION GATES
+//
+// The original suite verified the cooperative-abort event only at the task
+// level, only the task-level external abort signal, and only counted events
+// in concurrent mode. Several common-but-wrong implementations therefore slip
+// through: dispatching the event on the task but not the bench, wiring only the
+// task signal and ignoring the bench signal, using a single per-task timer, or
+// emitting a cooperative-abort on external aborts. Each gate below pins one of
+// those surfaces to the public contract: it fails on base code (no signal), and
+// fails a specific plausible-but-wrong implementation, while any correct
+// implementation passes. Timing margins are deliberately wide.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// (F) Bench-level event gate — the contract requires 'cooperative-abort' to be
+// part of BenchEvents, not only TaskEvents. The timeout must dispatch the event
+// on the bench as well, carrying the originating task. A solution that only
+// dispatches on the task object fails here.
+// ---------------------------------------------------------------------------
+
+test("'cooperative-abort' is dispatched at the bench level with the originating task on timeout", async () => {
+  let benchEventFired = false
+  let observedType: string | undefined
+  let associatedTask: unknown
+
+  const bench = new Bench({ cooperativeAbortTimeout: 50, iterations: 1, time: 0, warmup: false })
+
+  const slowFn = async (_signal?: AbortSignal) => {
+    await new Promise<void>(resolve => setTimeout(resolve, 200))
+  }
+
+  bench.add('bench-level-event-task', slowFn)
+
+  bench.addEventListener('cooperative-abort', event => {
+    benchEventFired = true
+    observedType = event.type
+    associatedTask = event.task
+  })
+
+  await bench.run()
+
+  const task = bench.getTask('bench-level-event-task')
+  expect(benchEventFired).toBe(true)
+  expect(observedType).toBe('cooperative-abort')
+  expect(associatedTask).toBe(task)
+})
+
+// ---------------------------------------------------------------------------
+// (G) Bench-level external abort gate — the spec aborts the cooperative signal
+// when the task OR the bench abort signal fires. The original suite only ever
+// supplied a task-level signal via add(..., { signal }). An implementation that
+// wires only the task signal and ignores the bench-level signal fails here. The
+// abort must be observable synchronously inside the same iteration.
+// ---------------------------------------------------------------------------
+
+test('cooperative signal aborts synchronously when the bench-level abort signal fires during an iteration', async () => {
+  const controller = new AbortController()
+  let observedSynchronously = false
+
+  const bench = new Bench({
+    cooperativeAbortTimeout: 500,
+    iterations: 1,
+    signal: controller.signal,
+    time: 0,
+    warmup: false,
+  })
+
+  const benchSignalProbeFn = (signal?: AbortSignal) => {
+    controller.abort()
+    observedSynchronously = signal?.aborted === true
+  }
+
+  bench.add('bench-signal-probe-task', benchSignalProbeFn)
+
+  await bench.run()
+
+  expect(observedSynchronously).toBe(true)
+})
+
+// ---------------------------------------------------------------------------
+// (H) Sequential per-iteration counting gate — N timed-out sequential
+// iterations must emit exactly N cooperative-abort events. The original suite
+// only counted events for concurrency: 'task'. A single per-task / cumulative
+// timer emits one event total and fails here.
+// ---------------------------------------------------------------------------
+
+test('sequential mode emits exactly one cooperative-abort per timed-out iteration', async () => {
+  let eventCount = 0
+  const iterations = 3
+
+  const bench = new Bench({ cooperativeAbortTimeout: 25, iterations, time: 0, warmup: false })
+
+  const alwaysTimeoutFn = async (signal?: AbortSignal) => {
+    await new Promise<void>(resolve => {
+      const fallback = setTimeout(resolve, 200)
+      signal?.addEventListener('abort', () => {
+        clearTimeout(fallback)
+        resolve()
+      }, { once: true })
+      if (signal?.aborted === true) {
+        clearTimeout(fallback)
+        resolve()
+      }
+    })
+  }
+
+  bench.add('sequential-count-task', alwaysTimeoutFn)
+
+  const task = bench.getTask('sequential-count-task')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => { eventCount += 1 })
+
+  await bench.run()
+
+  expect(eventCount).toBe(iterations)
+})
+
+// ---------------------------------------------------------------------------
+// (I) Selective-emission gate — only iterations that actually exceed the
+// timeout may emit an event. A run that mixes fast and slow iterations must
+// emit exactly one event per slow iteration and none for the fast ones. An
+// "always emit" implementation over-counts; a per-task timer mis-counts.
+// ---------------------------------------------------------------------------
+
+test('only iterations exceeding the timeout emit cooperative-abort; fast iterations stay silent', async () => {
+  let eventCount = 0
+  let call = 0
+  const iterations = 4
+
+  const bench = new Bench({ cooperativeAbortTimeout: 40, iterations, time: 0, warmup: false })
+
+  const mixedFn = async (signal?: AbortSignal) => {
+    const isSlow = call % 2 === 1
+    call += 1
+    await new Promise<void>(resolve => {
+      const fallback = setTimeout(resolve, isSlow ? 200 : 5)
+      signal?.addEventListener('abort', () => {
+        clearTimeout(fallback)
+        resolve()
+      }, { once: true })
+      if (signal?.aborted === true) {
+        clearTimeout(fallback)
+        resolve()
+      }
+    })
+  }
+
+  bench.add('mixed-speed-task', mixedFn)
+
+  const task = bench.getTask('mixed-speed-task')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => { eventCount += 1 })
+
+  await bench.run()
+
+  expect(eventCount).toBe(2)
+})
+
+// ---------------------------------------------------------------------------
+// (J) Concurrent external-abort gate — in concurrency: 'task' mode an external
+// abort must synchronously abort every in-flight cooperative signal yet must
+// NOT emit 'cooperative-abort' (reserved for timeouts). An implementation that
+// routes the external abort through the timeout path emits a spurious event and
+// fails here; one that ignores external aborts in the concurrent path fails the
+// synchronous-abort assertion.
+// ---------------------------------------------------------------------------
+
+test("concurrency 'task' mode: external abort aborts cooperative signal without emitting 'cooperative-abort'", async () => {
+  const controller = new AbortController()
+  let observedSignalAbort = false
+  let cooperativeAbortEventFired = false
+
+  const bench = new Bench({
+    concurrency: 'task',
+    cooperativeAbortTimeout: 1000,
+    iterations: 1,
+    signal: controller.signal,
+    time: 0,
+    warmup: false,
+  })
+
+  const concurrentExternalAbortFn = async (signal?: AbortSignal) => {
+    signal?.addEventListener('abort', () => {
+      observedSignalAbort = true
+    }, { once: true })
+    controller.abort()
+    await Promise.resolve()
+  }
+
+  bench.add('concurrent-external-abort-task', concurrentExternalAbortFn)
+
+  const task = bench.getTask('concurrent-external-abort-task')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => {
+    cooperativeAbortEventFired = true
+  })
+
+  await bench.run()
+
+  expect(observedSignalAbort).toBe(true)
+  expect(cooperativeAbortEventFired).toBe(false)
+})
+
+// ---------------------------------------------------------------------------
+// (K) Opt-in gate for the concurrent path — when enabled, concurrency: 'task'
+// must deliver a real signal; when disabled, the handler's first argument must
+// remain undefined, exactly like the sequential path. The enabled assertion
+// fails on base code (no signal). The disabled assertion fails any
+// implementation that always injects a controller in withConcurrency
+// regardless of the opt-in value.
+// ---------------------------------------------------------------------------
+
+test("concurrency 'task' mode: cooperative signal is opt-in (delivered when enabled, undefined when disabled)", async () => {
+  let enabledFirstArg: unknown = 'unset'
+  let disabledFirstArg: unknown = 'unset'
+
+  const enabledBench = new Bench({ concurrency: 'task', cooperativeAbortTimeout: 50, iterations: 1, time: 0, warmup: false })
+  enabledBench.add('concurrent-enabled-probe', (signal?: AbortSignal) => { enabledFirstArg = signal })
+  await enabledBench.run()
+
+  const disabledBench = new Bench({ concurrency: 'task', cooperativeAbortTimeout: 0, iterations: 1, time: 0, warmup: false })
+  disabledBench.add('concurrent-disabled-probe', (signal?: AbortSignal) => { disabledFirstArg = signal })
+  await disabledBench.run()
+
+  expect(enabledFirstArg).toBeInstanceOf(AbortSignal)
+  expect(disabledFirstArg).toBeUndefined()
+})
+
+// ---------------------------------------------------------------------------
+// (L) Bench-level counting gate — the bench-level dispatch must also be
+// per-timeout, not a single summary event. N sequential timeouts produce N
+// bench-level cooperative-abort events. A solution that dispatches on the bench
+// once per task run rather than once per timeout fails here.
+// ---------------------------------------------------------------------------
+
+test('bench-level cooperative-abort is emitted once per timed-out iteration', async () => {
+  let benchEventCount = 0
+  const iterations = 3
+
+  const bench = new Bench({ cooperativeAbortTimeout: 25, iterations, time: 0, warmup: false })
+
+  const alwaysTimeoutFn = async (signal?: AbortSignal) => {
+    await new Promise<void>(resolve => {
+      const fallback = setTimeout(resolve, 200)
+      signal?.addEventListener('abort', () => {
+        clearTimeout(fallback)
+        resolve()
+      }, { once: true })
+      if (signal?.aborted === true) {
+        clearTimeout(fallback)
+        resolve()
+      }
+    })
+  }
+
+  bench.add('bench-count-task', alwaysTimeoutFn)
+
+  bench.addEventListener('cooperative-abort', () => { benchEventCount += 1 })
+
+  await bench.run()
+
+  expect(benchEventCount).toBe(iterations)
+})
+
+// ===========================================================================
+// V3 EDGE-CASE GATES
+//
+// Two holes in the cancellation contract that the gates above do not catch:
+//
+//   1. Stale-timer-after-external-abort: an EXTERNAL abort (task or bench
+//      signal) must synchronously cancel the in-flight per-iteration timeout
+//      handle, so a handler that ignores the signal and keeps running past
+//      `cooperativeAbortTimeout` can NEVER later emit a (timeout-only)
+//      'cooperative-abort'. This must hold on BOTH the sequential async path
+//      and the concurrent ('concurrency: task') path. A solution that aborts
+//      the controller but leaves the setTimeout pending fails here.
+//
+//   2. Dual-signal wiring in the concurrent path: when BOTH a task-level and a
+//      bench-level abort signal exist, EITHER firing must synchronously abort
+//      the in-flight cooperative signal. A solution that forwards only
+//      `taskSignal ?? benchSignal` into the concurrent helper drops the
+//      bench-level signal and fails the bench-level gate below.
+//
+// Every gate fails on base code (no signal delivered) and on the specific
+// wrong implementation it targets, while any correct solution passes. Timing
+// margins are deliberately wide so the assertions are deterministic.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// (M) Sequential stale-timer gate — external abort mid-iteration must cancel
+// the pending timeout so no timeout-only event is emitted, even when the
+// handler outlives the timeout.
+// ---------------------------------------------------------------------------
+
+test('sequential: external abort mid-iteration cancels the pending timeout (no stale cooperative-abort)', async () => {
+  const controller = new AbortController()
+  let coopEvents = 0
+  let observedSynchronously = false
+
+  const bench = new Bench({
+    cooperativeAbortTimeout: 50,
+    iterations: 1,
+    time: 0,
+    warmup: false,
+  })
+
+  // Deliberately IGNORES the cooperative signal and keeps running well past the
+  // 50 ms timeout, after firing the external abort up front.
+  const stubbornFn = async (signal?: AbortSignal) => {
+    controller.abort()
+    observedSynchronously = signal?.aborted === true
+    await new Promise<void>(resolve => setTimeout(resolve, 300))
+  }
+
+  bench.add('seq-stubborn', stubbornFn, { signal: controller.signal })
+  const task = bench.getTask('seq-stubborn')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => { coopEvents += 1 })
+
+  await bench.run()
+
+  // External abort is observed synchronously inside the iteration ...
+  expect(observedSynchronously).toBe(true)
+  // ... and a stale timer must NOT later emit a timeout-only event.
+  expect(coopEvents).toBe(0)
+
+  // Wait past any conceivable stale timer to be certain none fires late.
+  await new Promise<void>(resolve => setTimeout(resolve, 100))
+  expect(coopEvents).toBe(0)
+})
+
+// ---------------------------------------------------------------------------
+// (N) Concurrent stale-timer gate — same contract through withConcurrency.
+// ---------------------------------------------------------------------------
+
+test("concurrency 'task': external abort mid-iteration cancels the pending timeout (no stale cooperative-abort)", async () => {
+  const controller = new AbortController()
+  let coopEvents = 0
+  let observedSynchronously = false
+
+  const bench = new Bench({
+    concurrency: 'task',
+    cooperativeAbortTimeout: 50,
+    iterations: 1,
+    time: 0,
+    warmup: false,
+  })
+
+  const stubbornFn = async (signal?: AbortSignal) => {
+    controller.abort()
+    observedSynchronously = signal?.aborted === true
+    await new Promise<void>(resolve => setTimeout(resolve, 300))
+  }
+
+  bench.add('conc-stubborn', stubbornFn, { signal: controller.signal })
+  const task = bench.getTask('conc-stubborn')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => { coopEvents += 1 })
+
+  await bench.run()
+
+  expect(observedSynchronously).toBe(true)
+  expect(coopEvents).toBe(0)
+
+  await new Promise<void>(resolve => setTimeout(resolve, 100))
+  expect(coopEvents).toBe(0)
+})
+
+// ---------------------------------------------------------------------------
+// (O) Concurrent bench-level dual-signal gate — with a task-level signal also
+// present, the BENCH-level signal must still synchronously abort the in-flight
+// cooperative signal (it must not be dropped by `taskSignal ?? benchSignal`).
+// ---------------------------------------------------------------------------
+
+test("concurrency 'task': bench-level abort aborts the in-flight cooperative signal even when a task signal also exists", async () => {
+  const taskController = new AbortController() // present but never aborted
+  const benchController = new AbortController()
+  let observedSynchronously = false
+  let coopEvents = 0
+
+  const bench = new Bench({
+    concurrency: 'task',
+    cooperativeAbortTimeout: 1000,
+    iterations: 1,
+    signal: benchController.signal,
+    time: 0,
+    warmup: false,
+  })
+
+  const fn = async (signal?: AbortSignal) => {
+    // Fire the BENCH signal (the one dropped by `task ?? bench`) mid-iteration.
+    benchController.abort()
+    observedSynchronously = signal?.aborted === true
+    await Promise.resolve()
+  }
+
+  // Provide a task-level signal as well so both upstream signals are present.
+  bench.add('conc-dual-signal', fn, { signal: taskController.signal })
+  const task = bench.getTask('conc-dual-signal')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => { coopEvents += 1 })
+
+  await bench.run()
+
+  // The bench-level abort must reach the in-flight cooperative signal ...
+  expect(observedSynchronously).toBe(true)
+  // ... and external abort must not emit a timeout-only event.
+  expect(coopEvents).toBe(0)
+})
+
+// ---------------------------------------------------------------------------
+// (P) Concurrent task-level dual-signal gate — symmetric guard: with a bench
+// signal also present, a task-level abort must still synchronously abort the
+// in-flight cooperative signal (guards against a fix that wires only the bench
+// signal).
+// ---------------------------------------------------------------------------
+
+test("concurrency 'task': task-level abort aborts the in-flight cooperative signal even when a bench signal also exists", async () => {
+  const taskController = new AbortController()
+  const benchController = new AbortController() // present but never aborted
+  let observedSynchronously = false
+  let coopEvents = 0
+
+  const bench = new Bench({
+    concurrency: 'task',
+    cooperativeAbortTimeout: 1000,
+    iterations: 1,
+    signal: benchController.signal,
+    time: 0,
+    warmup: false,
+  })
+
+  const fn = async (signal?: AbortSignal) => {
+    taskController.abort()
+    observedSynchronously = signal?.aborted === true
+    await Promise.resolve()
+  }
+
+  bench.add('conc-dual-signal-task', fn, { signal: taskController.signal })
+  const task = bench.getTask('conc-dual-signal-task')
+  expect(task).toBeDefined()
+  if (!task) return
+  task.addEventListener('cooperative-abort', () => { coopEvents += 1 })
+
+  await bench.run()
+
+  expect(observedSynchronously).toBe(true)
+  expect(coopEvents).toBe(0)
+})

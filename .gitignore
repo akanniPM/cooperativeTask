@@ -32,3 +32,12 @@ yarn-error.log*
 # misc
 .DS_Store
 .orig
+
+# working artifacts
+*.patch
+AGENT RUN/
+problem-description.md
+run-base-tests.sh
+test.sh
+Dockerfile
+.dockerignore

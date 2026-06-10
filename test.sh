@@ -38,13 +38,13 @@ case "$MODE" in
     # here to keep base mode deterministic. The graded feature file is excluded
     # because it is exercised separately by `new` mode.
     exec pnpm exec vitest "${ARGS[@]}" --dir test \
-      --exclude '**/cooperative-abort.623654.test.ts' \
+      --exclude '**/cooperative-abort.test.ts' \
       --exclude '**/basic-async-hrtime-now.test.ts' \
       --exclude '**/basic-async-performance-now.test.ts' \
       --exclude '**/basic-sync-hrtime-now.test.ts' \
       --exclude '**/basic-sync-performane-now.test.ts'
     ;;
   new)
-    exec pnpm exec vitest "${ARGS[@]}" test/cooperative-abort.623654.test.ts
+    exec pnpm exec vitest "${ARGS[@]}" test/cooperative-abort.test.ts
     ;;
 esac
